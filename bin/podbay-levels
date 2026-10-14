@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Sound levels for Podbay's dancing pixels.
+
+Listens to what is playing (the default output's monitor, via parec) and
+prints eight band levels (0..1, bass to treble) about 20 times a second:
+
+    0.82 0.64 0.40 0.31 0.22 0.15 0.08 0.03
+
+Run by the shell plugin only while the panel is open and AirPods are
+connected. Pure stdlib: Goertzel filters on 512-sample frames at 11 kHz.
+"""
+import math
+import struct
+import subprocess
+import sys
+
+RATE = 11025
+N = 512                     # ~46 ms per frame
+BANDS = [60, 150, 300, 600, 1200, 2200, 3500, 5000]  # Hz, band centres
+COEF = [2 * math.cos(2 * math.pi * round(f * N / RATE) / N) for f in BANDS]
+WINDOW = [0.5 - 0.5 * math.cos(2 * math.pi * i / (N - 1)) for i in range(N)]
+
+
+def band_power(samples, coef):
+    s1 = s2 = 0.0
+    for x in samples:
+        s0 = x + coef * s1 - s2
+        s2, s1 = s1, s0
+    return s1 * s1 + s2 * s2 - coef * s1 * s2
+
+
+def main():
+    source = sys.argv[1] if len(sys.argv) > 1 else "@DEFAULT_MONITOR@"
+    proc = subprocess.Popen(
+        ["parec", "-d", source, "--format=s16le", "--rate=%d" % RATE, "--channels=1",
+         "--raw", "--latency-msec=40"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    peak = [1e-3] * len(BANDS)   # per-band auto gain, slowly decaying
+    smooth = [0.0] * len(BANDS)
+    try:
+        while True:
+            raw = proc.stdout.read(N * 2)
+            if len(raw) < N * 2:
+                break
+            pcm = struct.unpack("<%dh" % N, raw)
+            samples = [pcm[i] * WINDOW[i] / 32768.0 for i in range(N)]
+            out = []
+            for b, coef in enumerate(COEF):
+                p = math.sqrt(max(0.0, band_power(samples, coef))) / N
+                peak[b] = max(p, peak[b] * 0.995, 2e-4)
+                v = min(1.0, p / peak[b]) if p > 1e-4 else 0.0
+                # Fast attack, slower fall: reads as a bouncing meter.
+                smooth[b] = v if v > smooth[b] else smooth[b] * 0.75 + v * 0.25
+                out.append("%.2f" % smooth[b])
+            print(" ".join(out), flush=True)
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
+    finally:
+        proc.terminate()
+
+
+if __name__ == "__main__":
+    main()

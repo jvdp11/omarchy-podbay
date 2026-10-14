@@ -1,0 +1,914 @@
+#!/usr/bin/env python3
+"""Podbay daemon: AirPods on Linux, for the jvdp.podbay shell plugin.
+
+Talks JSON lines: commands in on stdin, state out on stdout. The shell
+plugin (Service.qml) runs exactly one of these.
+
+What it does:
+  * Watches BlueZ for AirPods (Apple vendor id 0x004C, product 0x20xx).
+  * Listens for Apple "proximity pairing" BLE adverts, which AirPods send
+    when the case opens or the Max leaves its case: model, rough battery
+    (10 % steps), lid state. That is how we know they are "here".
+  * Auto-connects a paired pair when it appears; auto-pairs a new pair it
+    finds in pairing mode (button on the case / Max held).
+  * Speaks AAP (Apple Accessory Protocol, L2CAP PSM 0x1001) to a connected
+    pair: noise-control mode (read + set, also when changed on the device),
+    exact battery per bud/case, ear detection.
+
+Commands (stdin, one JSON object per line):
+  {"cmd": "mode", "address": "AA:..", "mode": "anc|transparency|adaptive|off"}
+  {"cmd": "connect"|"disconnect"|"pair"|"forget", "address": "AA:.."}
+  {"cmd": "watch", "on": true}          panel open: scan continuously
+  {"cmd": "pairwindow", "seconds": 60}  look for a pair in pairing mode
+  {"cmd": "settings", "autoConnect": true, "autoPair": true,
+   "order": ["AA:..", ...],              preference, first = most wanted
+   "manualOnly": ["AA:..", ...]}         pairs that never auto-connect
+"""
+import json
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+import dbus
+import dbus.mainloop.glib
+import dbus.service
+from gi.repository import GLib
+
+BLUEZ = "org.bluez"
+ADAPTER = "org.bluez.Adapter1"
+DEVICE = "org.bluez.Device1"
+BATTERY = "org.bluez.Battery1"
+PROPS = "org.freedesktop.DBus.Properties"
+OBJMGR = "org.freedesktop.DBus.ObjectManager"
+AGENT_PATH = "/dev/jvdp/podbay/agent"
+
+APPLE = 0x004C
+AAP_PSM = 0x1001
+
+ANC3 = ["off", "transparency", "anc"]
+ANC4 = ["off", "transparency", "adaptive", "anc"]
+
+# Apple Bluetooth product ids. Ids marked "seen" were observed on this
+# machine; the others come from LibrePods / OpenPods. Unknown 0x20xx ids
+# still work: their kind is guessed from the name or the advert layout.
+MODELS = {
+    0x2002: ("AirPods", "buds", []),
+    0x200F: ("AirPods (2nd gen)", "buds", []),
+    0x2013: ("AirPods (3rd gen)", "buds", []),
+    0x2019: ("AirPods 4", "buds", []),
+    0x201B: ("AirPods 4 (ANC)", "buds", ANC4),
+    0x200E: ("AirPods Pro", "pro", ANC3),
+    0x2014: ("AirPods Pro 2", "pro", ANC4),
+    0x2024: ("AirPods Pro 2 (USB-C)", "pro", ANC4),
+    0x2027: ("AirPods Pro 3", "pro", ANC4),
+    0x200A: ("AirPods Max", "max", ANC3),
+    0x201F: ("AirPods Max (USB-C)", "max", ANC3),
+    0x202D: ("AirPods Max 2", "max", ANC4),  # seen; single battery, no case
+}
+MODE_BYTE = {"off": 1, "anc": 2, "transparency": 3, "adaptive": 4}
+MODE_NAME = {v: k for k, v in MODE_BYTE.items()}
+
+AAP_HANDSHAKE = bytes.fromhex("00000400010002000000000000000000")
+AAP_FEATURES = bytes.fromhex("040004004d00ff00000000000000")
+AAP_NOTIFY = bytes.fromhex("040004000f00ffffffff")
+AAP_HEADER = bytes.fromhex("04000400")
+
+NEARBY_TTL = 45          # s without an advert before a pair counts as gone (> PERIODIC_EVERY)
+PERIODIC_EVERY = 30      # s between background LE scans
+PERIODIC_LEN = 6         # s per background scan
+AUTOCONNECT_GAP = 45     # s between auto-connect attempts per device
+PAIR_WINDOW_GAP = 600    # s before an unknown pair nearby opens another pairing window
+
+
+class Audio:
+    """Moves sound and mic to a connected pair, and back when it leaves.
+
+    Uses Omarchy's own `omarchy-audio-{output,input}-set-default`, which also
+    move the streams already playing/recording. The defaults from before the
+    AirPods connected are remembered and restored when they disconnect."""
+
+    STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+                         "podbay", "audio-previous.json")
+
+    def __init__(self):
+        # "sink"/"source" -> name before the AirPods took over. Kept on disk so
+        # a restart while connected still knows where to go back to.
+        try:
+            with open(self.STATE) as f:
+                self.previous = {k: v for k, v in json.load(f).items()
+                                 if k in ("sink", "source") and isinstance(v, str)}
+        except (OSError, ValueError):
+            self.previous = {}
+
+    def _save(self):
+        try:
+            os.makedirs(os.path.dirname(self.STATE), exist_ok=True)
+            tmp = self.STATE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.previous, f)
+            os.replace(tmp, self.STATE)
+        except OSError as e:
+            log("audio state", e)
+
+    def _json(self, what):
+        try:
+            out = subprocess.run(["pactl", "-f", "json", "list", what], capture_output=True,
+                                 text=True, timeout=4).stdout
+            return json.loads(out or "[]")
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return []
+
+    def _default(self, what):
+        try:
+            return subprocess.run(["pactl", "get-default-" + what], capture_output=True,
+                                  text=True, timeout=3).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+
+    def _node(self, what, match):
+        for n in self._json(what + "s"):
+            name = n.get("name", "")
+            if match(name) and not name.endswith(".monitor"):
+                return n.get("properties", {}).get("object.id"), name
+        return None, None
+
+    def _set(self, what, node_id, name):
+        cmd = "omarchy-audio-output-set-default" if what == "sink" else "omarchy-audio-input-set-default"
+        try:
+            subprocess.run([cmd, str(node_id), name], timeout=10, capture_output=True)
+            return True
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log("audio", cmd, e)
+            return False
+
+    def take(self, address, output, mic):
+        """True once everything wanted is switched (the nodes appear a moment
+        after the Bluetooth connection)."""
+        key = address.replace(":", "_")
+        done = True
+        for what, wanted, match in (
+            ("sink", output, lambda n: n.startswith("bluez_output." + key)),
+            ("source", mic, lambda n: n.startswith("bluez_input.") and n.replace(":", "_").endswith(key)),
+        ):
+            if not wanted:
+                continue
+            node_id, name = self._node(what, match)
+            if not node_id:
+                done = False
+                continue
+            current = self._default(what)
+            if current == name:
+                continue
+            if current and not current.startswith("bluez_"):
+                self.previous[what] = current
+                self._save()
+            self._set(what, node_id, name)
+        return done
+
+    def give_back(self):
+        for what, name in list(self.previous.items()):
+            node_id, found = self._node(what, lambda n, name=name: n == name)
+            current = self._default(what)
+            if node_id and (current.startswith("bluez_") or not current):
+                self._set(what, node_id, found)
+        self.previous = {}
+        self._save()
+
+
+def log(*a):
+    print("podbay:", *a, file=sys.stderr, flush=True)
+
+
+def pid_from_modalias(modalias):
+    # bluetooth:v004Cp2014d0A01
+    m = str(modalias or "")
+    if not m.startswith("bluetooth:v004C") or "p" not in m[15:]:
+        return None
+    try:
+        return int(m[16:20], 16)
+    except ValueError:
+        return None
+
+
+def model_info(pid, name=""):
+    if pid in MODELS:
+        title, kind, modes = MODELS[pid]
+        return title, kind, list(modes)
+    n = (name or "").lower()
+    if "max" in n:
+        return "AirPods Max", "max", list(ANC4)
+    if "pro" in n:
+        return "AirPods Pro", "pro", list(ANC4)
+    return "AirPods", "buds", []
+
+
+def is_airpods(props):
+    pid = pid_from_modalias(props.get("Modalias"))
+    if pid is not None and (pid >> 8) == 0x20:
+        return True
+    name = str(props.get("Name") or props.get("Alias") or "")
+    return "airpods" in name.lower()
+
+
+def nib(v):
+    return None if v > 10 else v * 10
+
+
+def parse_proximity(data):
+    """Apple proximity-pairing advert (type 0x07) -> dict, or None."""
+    if len(data) < 10 or data[0] != 0x07:
+        return None
+    pid = data[3] | (data[4] << 8)
+    if (pid >> 8) != 0x20:
+        return None
+    # Prefix 0x00 = pairing mode: the pair's classic (BR/EDR) address follows
+    # the model, and the rest of the message shifts by six bytes.
+    #   07 19 00 2d20 70f94a90fbc7 21 33 ff 05 ...  (AirPods Max 2, seen)
+    o, address = 5, None
+    if data[2] == 0x00 and len(data) >= 15:
+        address = ":".join("%02X" % b for b in data[5:11])
+        o = 11
+    status = data[o]
+    pods = data[o + 1]
+    charge, case = data[o + 2] >> 4, data[o + 2] & 0x0F
+    if charge == 0x0F:
+        charge = 0  # unknown
+    # Which nibble is the left bud depends on which bud is "primary".
+    flipped = not (status & 0x20)
+    a, b = pods >> 4, pods & 0x0F
+    left, right = (b, a) if flipped else (a, b)
+    lc, rc = (charge & 0x2, charge & 0x1) if not flipped else (charge & 0x1, charge & 0x2)
+    title, kind, modes = model_info(pid)
+    if pid not in MODELS and case == 0x0F and (left == 0x0F) != (right == 0x0F):
+        kind = "max"  # one "bud", no case: over-ears
+    out = {"model": pid, "title": title, "kind": kind, "lidOpen": not (data[o + 3] & 0x08),
+           "pairingMode": address is not None, "address": address}
+    if kind == "max":
+        single = right if left == 0x0F else left
+        out["battery"] = {"single": nib(single)}
+        out["charging"] = {"single": bool(charge & 0x3)}
+    else:
+        out["battery"] = {"left": nib(left), "right": nib(right), "case": nib(case)}
+        out["charging"] = {"left": bool(lc), "right": bool(rc), "case": bool(charge & 0x4)}
+    return out
+
+
+class Agent(dbus.service.Object):
+    """Just-works pairing for the AirPods we decided to pair."""
+
+    def __init__(self, bus, daemon):
+        super().__init__(bus, AGENT_PATH)
+        self.d = daemon
+
+    def _ours(self, device):
+        p = self.d.devices.get(str(device), {})
+        return str(device) in self.d.pairing or bool(p.get("Paired")) and is_airpods(p)
+
+    def _check(self, device):
+        if not self._ours(device):
+            raise dbus.DBusException("org.bluez.Error.Rejected", "not an AirPods pairing")
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="", out_signature="")
+    def Release(self):
+        pass
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="os", out_signature="")
+    def AuthorizeService(self, device, uuid):
+        self._check(device)
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="s")
+    def RequestPinCode(self, device):
+        self._check(device)
+        return "0000"
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="u")
+    def RequestPasskey(self, device):
+        self._check(device)
+        return dbus.UInt32(0)
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="ouq", out_signature="")
+    def DisplayPasskey(self, device, passkey, entered):
+        pass
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="os", out_signature="")
+    def DisplayPinCode(self, device, pincode):
+        pass
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="ou", out_signature="")
+    def RequestConfirmation(self, device, passkey):
+        self._check(device)
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="")
+    def RequestAuthorization(self, device):
+        self._check(device)
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="", out_signature="")
+    def Cancel(self):
+        pass
+
+
+class AAP:
+    """One AAP control channel to a connected pair. Reads on a thread and
+    hands packets to the GLib loop."""
+
+    def __init__(self, daemon, path, address):
+        self.d, self.path, self.address = daemon, path, address
+        self.sock = None
+        self.closed = False
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        for attempt in range(3):
+            if self.closed:
+                return
+            try:
+                s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP)
+                s.settimeout(8)
+                s.connect((self.address, AAP_PSM))
+                s.settimeout(None)
+                self.sock = s
+                break
+            except OSError as e:
+                log("aap connect", self.address, e)
+                time.sleep(2 + attempt * 2)
+        if not self.sock:
+            GLib.idle_add(self.d.on_aap_state, self.path, False)
+            return
+        try:
+            for pkt in (AAP_HANDSHAKE, AAP_FEATURES, AAP_NOTIFY):
+                self.sock.send(pkt)
+                time.sleep(0.15)
+            GLib.idle_add(self.d.on_aap_state, self.path, True)
+            while not self.closed:
+                data = self.sock.recv(1024)
+                if not data:
+                    break
+                GLib.idle_add(self.d.on_aap, self.path, bytes(data))
+        except OSError as e:
+            if not self.closed:
+                log("aap read", self.address, e)
+        GLib.idle_add(self.d.on_aap_state, self.path, False)
+
+    def send(self, data):
+        try:
+            if self.sock:
+                self.sock.send(data)
+                return True
+        except OSError as e:
+            log("aap send", self.address, e)
+        return False
+
+    def close(self):
+        self.closed = True
+        try:
+            if self.sock:
+                self.sock.shutdown(socket.SHUT_RDWR)
+                self.sock.close()
+        except OSError:
+            pass
+
+
+class Daemon:
+    def __init__(self):
+        dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+        self.bus = dbus.SystemBus()
+        self.devices = {}       # path -> Device1 props (plus "Battery")
+        self.adapter_path = None
+        self.adapter = {}
+        self.nearby = {}        # model id -> advert dict + "seen"
+        self.aap = {}           # path -> AAP
+        self.live = {}          # path -> AAP-derived state
+        self.pairing = set()    # paths we are pairing
+        self.manual_off = set() # paths the user disconnected; no auto-connect until they leave
+        self.last_auto = {}     # path -> time of last auto-connect attempt
+        self.pair_window_at = {}  # model -> when its last pairing window opened
+        self.bredr_until = 0      # classic-only scan: a pair just entered pairing mode
+        self.pairing_mode = {}    # classic address -> (model, seen) from pairing-mode adverts
+        self.watch = False
+        self.pair_until = 0
+        self.discovering_by_us = False
+        self.periodic_until = 0
+        self.next_periodic = time.time() + 3
+        self.settings = {"autoConnect": True, "autoPair": True, "useOutput": True, "useMic": True,
+                         "order": [], "manualOnly": []}
+        self.audio = Audio()
+        self.error = ""
+        self.last_out = ""
+        self.emit_pending = False
+
+        om = dbus.Interface(self.bus.get_object(BLUEZ, "/"), OBJMGR)
+        for path, ifaces in om.GetManagedObjects().items():
+            self._ifaces_added(path, ifaces)
+        self.bus.add_signal_receiver(self._ifaces_added, "InterfacesAdded", OBJMGR)
+        self.bus.add_signal_receiver(self._ifaces_removed, "InterfacesRemoved", OBJMGR)
+        self.bus.add_signal_receiver(self._props_changed, "PropertiesChanged", PROPS,
+                                     bus_name=BLUEZ, path_keyword="path")
+
+        self.agent = Agent(self.bus, self)
+        try:
+            mgr = dbus.Interface(self.bus.get_object(BLUEZ, "/org/bluez"), "org.bluez.AgentManager1")
+            mgr.RegisterAgent(AGENT_PATH, "NoInputNoOutput")
+        except dbus.DBusException as e:
+            log("agent", e)
+
+        for path, p in self.devices.items():
+            if p.get("Connected") and is_airpods(p):
+                self._start_aap(path)
+
+        GLib.io_add_watch(sys.stdin.fileno(), GLib.IO_IN | GLib.IO_HUP, self._stdin)
+        GLib.timeout_add_seconds(1, self._tick)
+        self.emit()
+
+    # ---- BlueZ objects ---------------------------------------------------
+
+    def _ifaces_added(self, path, ifaces):
+        path = str(path)
+        if ADAPTER in ifaces and self.adapter_path is None:
+            self.adapter_path = path
+            self.adapter = dict(ifaces[ADAPTER])
+        if DEVICE in ifaces:
+            props = dict(ifaces[DEVICE])
+            if BATTERY in ifaces:
+                props["Battery"] = int(ifaces[BATTERY].get("Percentage", -1))
+            self.devices[path] = props
+            self._advert(path, props)
+            self._maybe_autopair(path)
+        self.emit()
+
+    def _ifaces_removed(self, path, ifaces):
+        path = str(path)
+        if DEVICE in ifaces:
+            self.devices.pop(path, None)
+            self._stop_aap(path)
+        if ADAPTER in ifaces and path == self.adapter_path:
+            self.adapter_path = None
+            self.adapter = {}
+        self.emit()
+
+    def _props_changed(self, iface, changed, invalidated, path=None):
+        path = str(path)
+        if iface == ADAPTER and path == self.adapter_path:
+            self.adapter.update(changed)
+            if "Discovering" in changed and not changed["Discovering"]:
+                self.discovering_by_us = False
+            self.emit()
+            return
+        if path not in self.devices:
+            return
+        p = self.devices[path]
+        if iface == BATTERY and "Percentage" in changed:
+            p["Battery"] = int(changed["Percentage"])
+            self.emit()
+            return
+        if iface != DEVICE:
+            return
+        was_connected = bool(p.get("Connected"))
+        p.update(changed)
+        if "ManufacturerData" in changed:
+            self._advert(path, p)
+        if "Connected" in changed and is_airpods(p):
+            if changed["Connected"] and not was_connected:
+                self.manual_off.discard(path)
+                GLib.timeout_add(1500, lambda: self._start_aap(path) and False)
+                self._route_audio(path)
+            elif not changed["Connected"]:
+                self._stop_aap(path)
+                if not any(d.get("Connected") and is_airpods(d) for d in self.devices.values()):
+                    GLib.timeout_add(800, lambda: self.audio.give_back() or False)
+        if "Paired" in changed or "Name" in changed or "Modalias" in changed:
+            self._maybe_autopair(path)
+        if is_airpods(p) or "ManufacturerData" not in changed:
+            self.emit()
+
+    # ---- Proximity adverts ------------------------------------------------
+
+    def _advert(self, path, props):
+        md = props.get("ManufacturerData")
+        if not md or APPLE not in md:
+            return
+        info = parse_proximity(bytes(md[APPLE]))
+        if not info:
+            return
+        info["rssi"] = int(props.get("RSSI", -100))
+        model = info["model"]
+        if info["pairingMode"]:
+            # Held the button: find it over classic Bluetooth (only that bearer
+            # pairs headphones), scanning classic-only for a moment.
+            now = time.time()
+            fresh = info["address"] not in self.pairing_mode
+            self.pairing_mode[info["address"]] = (model, now)
+            self.pair_until = max(self.pair_until, now + 60)
+            if fresh:
+                self.bredr_until = now + 20
+                self.event("pairingmode", title=info["title"], device=info["kind"])
+        appeared = model not in self.nearby
+        info["seen"] = time.time()
+        self.nearby[model] = info
+        if appeared:
+            self.event("nearby", title=info["title"], device=info["kind"])
+            self._auto_connect(model)
+            now = time.time()
+            if not self._paired_of_model(model) and now - self.pair_window_at.get(model, 0) > PAIR_WINDOW_GAP:
+                # A pair we don't know: look for it in pairing mode for a minute.
+                # Once per 10 min, so a pair that lives on your phone doesn't
+                # keep classic discovery running.
+                self.pair_window_at[model] = now
+                self.pair_until = max(self.pair_until, now + 60)
+        self.emit()
+
+    def _paired_of_model(self, model):
+        return [path for path, p in self.devices.items()
+                if p.get("Paired") and pid_from_modalias(p.get("Modalias")) == model]
+
+    def _rank(self, path):
+        """Position in the user's order of preference (lower = preferred)."""
+        order = [a.upper() for a in self.settings.get("order", [])]
+        addr = str(self.devices.get(path, {}).get("Address", "")).upper()
+        return order.index(addr) if addr in order else len(order)
+
+    def _auto_connect(self, model):
+        """A paired pair appeared. Connect it unless a pair you prefer is
+        already connected; if it beats the connected one, it takes over."""
+        if not self.settings["autoConnect"]:
+            return
+        now = time.time()
+        manual = {a.upper() for a in self.settings.get("manualOnly", [])}
+        connected = [q for q, d in self.devices.items() if d.get("Connected") and is_airpods(d)]
+        for path in sorted(self._paired_of_model(model), key=self._rank):
+            p = self.devices[path]
+            if p.get("Connected") or path in self.manual_off:
+                continue
+            if str(p.get("Address", "")).upper() in manual:
+                continue
+            if any(self._rank(q) <= self._rank(path) for q in connected):
+                continue  # you prefer the pair you're using
+            if now - self.last_auto.get(path, 0) < AUTOCONNECT_GAP:
+                continue
+            self.last_auto[path] = now
+            self.event("autoconnect", title=self._title(path))
+            self.connect(path, replace=connected)
+            return
+
+    def _maybe_autopair(self, path):
+        p = self.devices.get(path)
+        if not p or p.get("Paired") or not is_airpods(p):
+            return
+        if str(p.get("AddressType", "public")) == "random" or "Class" not in p:
+            # Only seen over LE so far. Pairing that object would try LE, which
+            # AirPods don't do for audio (it just hangs): wait for inquiry.
+            return
+        if not self.settings["autoPair"] or path in self.pairing:
+            return
+        if time.time() > self.pair_until and not self.watch:
+            return
+        self.pair(path)
+
+    # ---- Actions -----------------------------------------------------------
+
+    def _dev(self, path):
+        return dbus.Interface(self.bus.get_object(BLUEZ, path), DEVICE)
+
+    def _fail(self, what, path):
+        def handler(e):
+            name = e.get_dbus_name() if hasattr(e, "get_dbus_name") else ""
+            if name.endswith("AlreadyConnected") or name.endswith("AlreadyExists"):
+                return
+            self.error = "%s %s: %s" % (what, self._title(path), e.get_dbus_message() if hasattr(e, "get_dbus_message") else e)
+            log(self.error)
+            self.pairing.discard(path)
+            self.emit()
+        return handler
+
+    def connect(self, path, replace=()):
+        """Connect; `replace`: pairs to disconnect once this one is up (a
+        preferred pair taking over). Their audio defaults are not restored:
+        the new pair takes them."""
+        self.error = ""
+        self.manual_off.discard(path)
+
+        def done():
+            for q in replace:
+                if q != path and self.devices.get(q, {}).get("Connected"):
+                    self._dev(q).Disconnect(reply_handler=lambda: None,
+                                            error_handler=self._fail("Disconnect", q), timeout=15)
+
+        self._dev(path).Connect(reply_handler=done,
+                                error_handler=self._fail("Connect", path), timeout=30)
+
+    def disconnect(self, path):
+        self.manual_off.add(path)
+        self._dev(path).Disconnect(reply_handler=lambda: None,
+                                   error_handler=self._fail("Disconnect", path), timeout=15)
+
+    def pair(self, path):
+        self.error = ""
+        self.pairing.add(path)
+        self.event("pairing", title=self._title(path))
+        self.emit()
+
+        def paired():
+            self.pairing.discard(path)
+            try:
+                dbus.Interface(self.bus.get_object(BLUEZ, path), PROPS).Set(DEVICE, "Trusted", True)
+            except dbus.DBusException as e:
+                log("trust", e)
+            self.event("paired", title=self._title(path))
+            self.connect(path)
+
+        self._dev(path).Pair(reply_handler=paired, error_handler=self._fail("Pair", path), timeout=60)
+
+    def forget(self, path):
+        self._stop_aap(path)
+        try:
+            dbus.Interface(self.bus.get_object(BLUEZ, self.adapter_path), ADAPTER).RemoveDevice(path)
+        except dbus.DBusException as e:
+            self._fail("Forget", path)(e)
+
+    def set_mode(self, path, mode):
+        if mode not in MODE_BYTE:
+            return
+        conn = self.aap.get(path)
+        if not conn or not conn.send(bytes.fromhex("0400040009000d") + bytes([MODE_BYTE[mode], 0, 0, 0])):
+            self.error = "Noise control needs the AirPods connected"
+            self.emit()
+            return
+        # Optimistic; the AirPods confirm with a notification.
+        self.live.setdefault(path, {})["mode"] = mode
+        self.emit()
+
+    def _route_audio(self, path, tries=20):
+        """Sound and mic to the pair; retried while PipeWire creates the nodes."""
+        p = self.devices.get(path)
+        if not p or not p.get("Connected"):
+            return False
+        s = self.settings
+        if not (s["useOutput"] or s["useMic"]):
+            return False
+        if self.audio.take(str(p.get("Address")), s["useOutput"], s["useMic"]) or tries <= 0:
+            return False
+        GLib.timeout_add(1000, lambda: self._route_audio(path, tries - 1) and False)
+        return False
+
+    # ---- AAP -----------------------------------------------------------------
+
+    def _start_aap(self, path):
+        p = self.devices.get(path)
+        if not p or not p.get("Connected") or path in self.aap:
+            return False
+        self.aap[path] = AAP(self, path, str(p.get("Address")))
+        return False
+
+    def _stop_aap(self, path):
+        conn = self.aap.pop(path, None)
+        if conn:
+            conn.close()
+        self.live.pop(path, None)
+
+    def on_aap_state(self, path, up):
+        st = self.live.setdefault(path, {})
+        st["aap"] = bool(up)
+        if not up and path in self.aap and self.aap[path].closed is False:
+            self.aap.pop(path, None)
+        self.emit()
+        return False
+
+    def on_aap(self, path, data):
+        st = self.live.setdefault(path, {})
+        if len(data) < 7 or data[:4] != AAP_HEADER:
+            return False
+        op = data[4] | (data[5] << 8)
+        if op == 0x04 and len(data) >= 7:  # battery
+            batt, chg = {}, {}
+            names = {1: "single", 2: "right", 4: "left", 8: "case"}
+            i = 7
+            for _ in range(data[6]):
+                if i + 3 >= len(data):
+                    break
+                comp, level, status = data[i], data[i + 2], data[i + 3]
+                key = names.get(comp, "c%d" % comp)
+                if status != 0x04 and level <= 100:  # 0x04 = not connected
+                    batt[key] = level
+                    chg[key] = status == 0x01
+                i += 5
+            if batt:
+                st["battery"], st["charging"] = batt, chg
+        elif op == 0x06 and len(data) >= 8:  # ear detection
+            where = {0: "ear", 1: "out", 2: "case"}
+            st["ear"] = [where.get(data[6], "?"), where.get(data[7], "?")]
+        elif op == 0x09 and len(data) >= 8:  # control setting
+            if data[6] == 0x0D and data[7] in MODE_NAME:
+                st["mode"] = MODE_NAME[data[7]]
+        self.emit()
+        return False
+
+    # ---- Scanning --------------------------------------------------------------
+
+    def _adapter(self):
+        return dbus.Interface(self.bus.get_object(BLUEZ, self.adapter_path), ADAPTER)
+
+    def _want_scan(self, now):
+        if not self.adapter_path or not self.adapter.get("Powered"):
+            return None
+        if now < self.bredr_until:
+            return "bredr"
+        if self.watch or now < self.pair_until:
+            return "auto"  # classic too: finds a pair in pairing mode
+        if now < self.periodic_until:
+            # An unpaired pair is around: include classic inquiry, which is
+            # the only way to see it once it is put in pairing mode.
+            new_nearby = any(not self._paired_of_model(m) for m in self.nearby)
+            return "auto" if (new_nearby and self.settings["autoPair"]) else "le"
+        return None
+
+    def _tick(self):
+        now = time.time()
+        # Forget pairs that went quiet (case closed, Max put away).
+        gone = [m for m, v in self.nearby.items() if now - v["seen"] > NEARBY_TTL]
+        for m in gone:
+            del self.nearby[m]
+            for path in self._paired_of_model(m):
+                self.manual_off.discard(path)
+        # Background look-around (a short LE scan) only while no AirPods are
+        # connected: scanning next to an A2DP stream can make audio stutter.
+        busy = any(p.get("Connected") and is_airpods(p) for p in self.devices.values())
+        if now >= self.next_periodic:
+            self.next_periodic = now + PERIODIC_EVERY
+            if (self.settings["autoConnect"] or self.settings["autoPair"]) and not busy:
+                self.periodic_until = now + PERIODIC_LEN
+        want = self._want_scan(now)
+        try:
+            if want and not self.discovering_by_us:
+                ad = self._adapter()
+                ad.SetDiscoveryFilter({"Transport": want, "DuplicateData": True})
+                ad.StartDiscovery()
+                self.discovering_by_us = want
+            elif want and self.discovering_by_us != want:
+                ad = self._adapter()
+                ad.StopDiscovery()
+                ad.SetDiscoveryFilter({"Transport": want, "DuplicateData": True})
+                ad.StartDiscovery()
+                self.discovering_by_us = want
+            elif not want and self.discovering_by_us:
+                self._adapter().StopDiscovery()
+                self.discovering_by_us = False
+        except dbus.DBusException as e:
+            if "InProgress" not in str(e):
+                log("discovery", e)
+        if gone:
+            self.emit()
+        return True
+
+    # ---- Output ------------------------------------------------------------------
+
+    def _title(self, path):
+        p = self.devices.get(path, {})
+        return str(p.get("Alias") or p.get("Name") or model_info(pid_from_modalias(p.get("Modalias")))[0])
+
+    def state(self):
+        now = time.time()
+        devs, pairable = [], []
+        for path, p in self.devices.items():
+            if not is_airpods(p):
+                continue
+            pid = pid_from_modalias(p.get("Modalias"))
+            title, kind, modes = model_info(pid, str(p.get("Name") or ""))
+            if not p.get("Paired"):
+                if str(p.get("AddressType", "public")) != "random" and "Class" in p:
+                    pairable.append({"address": str(p.get("Address")), "name": self._title(path),
+                                     "model": title, "kind": kind, "pairing": path in self.pairing})
+                continue
+            live = self.live.get(path, {})
+            near = self.nearby.get(pid) if pid is not None else None
+            battery, charging, approx = live.get("battery"), live.get("charging"), False
+            if not battery and near:
+                battery, charging, approx = near["battery"], near["charging"], True
+            if not battery and p.get("Battery", -1) >= 0:
+                battery, charging, approx = {"single": p["Battery"]}, {}, False
+            devs.append({
+                "address": str(p.get("Address")), "name": self._title(path), "model": title,
+                "modelId": pid, "kind": kind, "modes": modes,
+                "connected": bool(p.get("Connected")), "nearby": near is not None,
+                "lidOpen": bool(near and near.get("lidOpen")),
+                "aap": bool(live.get("aap")), "mode": live.get("mode", ""),
+                "battery": battery or {}, "charging": charging or {}, "batteryApprox": approx,
+                "ear": live.get("ear", []),
+                "rank": self._rank(path),
+                "autoConnect": str(p.get("Address", "")).upper() not in
+                               {a.upper() for a in self.settings.get("manualOnly", [])},
+            })
+        known = {d["modelId"] for d in devs}
+        nearby = [{"model": v["title"], "modelId": m, "kind": v["kind"], "battery": v["battery"],
+                   "charging": v["charging"], "lidOpen": v["lidOpen"], "rssi": v["rssi"],
+                   "paired": m in known}
+                  for m, v in self.nearby.items()]
+        devs.sort(key=lambda d: (d["rank"], d["name"].lower()))
+        return {
+            "type": "state",
+            "adapter": {"present": self.adapter_path is not None,
+                        "powered": bool(self.adapter.get("Powered")),
+                        "discovering": bool(self.adapter.get("Discovering"))},
+            "devices": devs, "pairable": pairable, "nearby": nearby,
+            "pairUntil": int(self.pair_until) if self.pair_until > now else 0,
+            "inPairingMode": [{"model": model_info(m)[0], "kind": model_info(m)[1]}
+                              for a, (m, t) in self.pairing_mode.items() if now - t < 30],
+            "watching": self.watch, "settings": self.settings, "error": self.error,
+        }
+
+    def emit(self):
+        # Coalesce bursts (adverts arrive many times a second).
+        if not self.emit_pending:
+            self.emit_pending = True
+            GLib.timeout_add(150, self._emit_now)
+
+    def _emit_now(self):
+        self.emit_pending = False
+        out = json.dumps(self.state(), separators=(",", ":"))
+        if out != self.last_out:
+            self.last_out = out
+            print(out, flush=True)
+        return False
+
+    def event(self, what, **kw):
+        kw.update(type="event", event=what)
+        print(json.dumps(kw, separators=(",", ":")), flush=True)
+
+    # ---- Input -------------------------------------------------------------------
+
+    def _path_for(self, address):
+        address = str(address or "").upper()
+        for path, p in self.devices.items():
+            if str(p.get("Address", "")).upper() == address:
+                return path
+        return None
+
+    def _stdin(self, fd, cond):
+        line = sys.stdin.readline()
+        if not line:
+            loop.quit()  # the shell went away
+            return False
+        try:
+            cmd = json.loads(line)
+        except ValueError:
+            return True
+        try:
+            self.handle(cmd)
+        except dbus.DBusException as e:
+            self.error = str(e.get_dbus_message() or e)
+            self.emit()
+        return True
+
+    def handle(self, cmd):
+        c = cmd.get("cmd")
+        path = self._path_for(cmd.get("address"))
+        if c == "watch":
+            self.watch = bool(cmd.get("on"))
+        elif c == "pairwindow":
+            self.pair_until = time.time() + max(0, min(300, int(cmd.get("seconds", 60))))
+        elif c == "settings":
+            for k in ("autoConnect", "autoPair", "useOutput", "useMic"):
+                if isinstance(cmd.get(k), bool):
+                    self.settings[k] = cmd[k]
+            for k in ("order", "manualOnly"):
+                if isinstance(cmd.get(k), list):
+                    self.settings[k] = [str(a)[:17] for a in cmd[k][:32]]
+        elif c == "power":
+            dbus.Interface(self.bus.get_object(BLUEZ, self.adapter_path), PROPS).Set(
+                ADAPTER, "Powered", dbus.Boolean(bool(cmd.get("on"))))
+        elif path and c == "connect":
+            self.connect(path)
+        elif path and c == "disconnect":
+            self.disconnect(path)
+        elif path and c == "pair":
+            self.pair(path)
+        elif path and c == "forget":
+            self.forget(path)
+        elif path and c == "mode":
+            self.set_mode(path, str(cmd.get("mode")))
+        elif path and c == "route":
+            self._route_audio(path)
+        elif c == "clearerror":
+            self.error = ""
+        self.emit()
+        GLib.idle_add(lambda: self._tick() and False)
+
+
+if __name__ == "__main__":
+    loop = GLib.MainLoop()
+    try:
+        d = Daemon()
+    except dbus.DBusException as e:
+        log("bluez unavailable:", e)
+        sys.exit(1)
+    try:
+        loop.run()
+    finally:
+        try:
+            if d.discovering_by_us:
+                d._adapter().StopDiscovery()
+        except Exception:
+            pass
+        for conn in list(d.aap.values()):
+            conn.close()

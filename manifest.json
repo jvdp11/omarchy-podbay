@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "jvdp.podbay",
+  "name": "Podbay",
+  "version": "0.1.0",
+  "author": "jvdp",
+  "license": "MIT",
+  "description": "AirPods for Omarchy: pixel-art AirPods Max and AirPods Pro in your theme colours, battery per bud and case, noise control (ANC, Transparency, Adaptive, Off), auto-connect when the case opens and auto-pairing.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Podbay",
+    "description": "AirPods: battery, noise control, connect and pair",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
