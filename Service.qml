@@ -224,7 +224,6 @@ Item {
   }
 
   property var lastConnected: ({})
-  property var notifiedNearby: ({})
 
   function notifyUser(title, body) {
     if (!notify) return
@@ -257,21 +256,15 @@ Item {
       }
     })
     lastConnected = nowConnected
-
-    // A pair you don't have here yet: say how to pair it, once per 10 minutes.
-    var t = Date.now() / 1000
-    newNearby.forEach(function(n) {
-      if (t - (notifiedNearby[n.modelId] || 0) < 600) return
-      notifiedNearby[n.modelId] = t
-      notifyUser(n.model + " nearby",
-        autoPair ? (n.kind === "max" ? "Hold the noise control button to pair them here"
-                                     : "Hold the button on the case to pair them here")
-                 : "Open Podbay to pair them")
-    })
+    // Unpaired AirPods nearby are usually someone else's: no notification.
+    // Only a pair put in pairing mode (onEvent) is treated as yours.
   }
 
   function onEvent(e) {
     if (e.event === "paired") notifyUser(String(e.title || "AirPods"), "Paired")
+    else if (e.event === "pairingmode")
+      notifyUser(String(e.title || "AirPods") + " in pairing mode",
+                 autoPair ? "Pairing them here…" : "Open Podbay to pair them")
   }
 
   Process {
