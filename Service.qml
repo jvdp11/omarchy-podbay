@@ -34,7 +34,7 @@ Item {
 
   // ---- Preferences ------------------------------------------------------------
   property bool autoConnect: true
-  property bool autoPair: true
+  property bool autoPair: false
   property bool notify: true
   property bool useOutput: true   // sound to the AirPods when they connect
   property bool useMic: true      // and their microphone
@@ -203,7 +203,8 @@ Item {
     var p = {}
     try { p = JSON.parse(text) } catch (e) { p = {} }
     if (typeof p.autoConnect === "boolean") autoConnect = p.autoConnect
-    if (typeof p.autoPair === "boolean") autoPair = p.autoPair
+    // Legacy autoPair settings cannot approve an unknown Bluetooth device.
+    autoPair = false
     if (typeof p.notify === "boolean") notify = p.notify
     if (typeof p.useOutput === "boolean") useOutput = p.useOutput
     if (typeof p.useMic === "boolean") useMic = p.useMic

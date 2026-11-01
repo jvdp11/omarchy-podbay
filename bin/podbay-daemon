@@ -9,8 +9,7 @@ What it does:
   * Listens for Apple "proximity pairing" BLE adverts, which AirPods send
     when the case opens or the Max leaves its case: model, rough battery
     (10 % steps), lid state. That is how we know they are "here".
-  * Auto-connects a paired pair when it appears; auto-pairs a new pair it
-    finds in pairing mode (button on the case / Max held).
+  * Auto-connects approved pairs; new pairs require a device-specific Pair click.
   * Speaks AAP (Apple Accessory Protocol, L2CAP PSM 0x1001) to a connected
     pair: noise-control mode (read + set, also when changed on the device),
     exact battery per bud/case, ear detection.
@@ -44,6 +43,9 @@ BATTERY = "org.bluez.Battery1"
 PROPS = "org.freedesktop.DBus.Properties"
 OBJMGR = "org.freedesktop.DBus.ObjectManager"
 AGENT_PATH = "/dev/jvdp/podbay/agent"
+
+AUDIO_SERVICES = frozenset("0000%s-0000-1000-8000-00805f9b34fb" % short
+                           for short in ("1108", "110a", "110b", "110c", "110d", "110e", "110f", "1112", "111e", "111f"))
 
 APPLE = 0x004C
 AAP_PSM = 0x1001
@@ -265,7 +267,7 @@ class Agent(dbus.service.Object):
 
     def _ours(self, device):
         p = self.d.devices.get(str(device), {})
-        return str(device) in self.d.pairing or bool(p.get("Paired")) and is_airpods(p)
+        return str(device) in self.d.pairing or (bool(p.get("Paired")) and bool(p.get("Trusted")) and is_airpods(p))
 
     def _check(self, device):
         if not self._ours(device):
@@ -278,6 +280,8 @@ class Agent(dbus.service.Object):
     @dbus.service.method("org.bluez.Agent1", in_signature="os", out_signature="")
     def AuthorizeService(self, device, uuid):
         self._check(device)
+        if str(uuid).lower() not in AUDIO_SERVICES:
+            raise dbus.DBusException("org.bluez.Error.Rejected", "not an audio service")
 
     @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="s")
     def RequestPinCode(self, device):
@@ -392,7 +396,7 @@ class Daemon:
         self.discovering_by_us = False
         self.periodic_until = 0
         self.next_periodic = time.time() + 3
-        self.settings = {"autoConnect": True, "autoPair": True, "useOutput": True, "useMic": True,
+        self.settings = {"autoConnect": True, "autoPair": False, "useOutput": True, "useMic": True,
                          "order": [], "manualOnly": []}
         self.audio = Audio()
         self.error = ""
@@ -521,7 +525,7 @@ class Daemon:
 
     def _paired_of_model(self, model):
         return [path for path, p in self.devices.items()
-                if p.get("Paired") and pid_from_modalias(p.get("Modalias")) == model]
+                if p.get("Paired") and p.get("Trusted") and pid_from_modalias(p.get("Modalias")) == model]
 
     def _rank(self, path):
         """Position in the user's order of preference (lower = preferred)."""
@@ -553,18 +557,9 @@ class Daemon:
             return
 
     def _maybe_autopair(self, path):
-        p = self.devices.get(path)
-        if not p or p.get("Paired") or not is_airpods(p):
-            return
-        if str(p.get("AddressType", "public")) == "random" or "Class" not in p:
-            # Only seen over LE so far. Pairing that object would try LE, which
-            # AirPods don't do for audio (it just hangs): wait for inquiry.
-            return
-        if not self.settings["autoPair"] or path in self.pairing:
-            return
-        if time.time() > self.pair_until and not self.watch:
-            return
-        self.pair(path)
+        # Discovery/name/advertisement data are unauthenticated. In particular,
+        # a legacy autoPair=true setting must never authorize a new device.
+        return
 
     # ---- Actions -----------------------------------------------------------
 
@@ -604,6 +599,9 @@ class Daemon:
                                    error_handler=self._fail("Disconnect", path), timeout=15)
 
     def pair(self, path):
+        p = self.devices.get(path, {})
+        if not is_airpods(p) or p.get("Paired") or "Class" not in p or str(p.get("AddressType", "public")) != "public":
+            return
         self.error = ""
         self.pairing.add(path)
         self.event("pairing", title=self._title(path))
@@ -868,7 +866,7 @@ class Daemon:
         elif c == "pairwindow":
             self.pair_until = time.time() + max(0, min(300, int(cmd.get("seconds", 60))))
         elif c == "settings":
-            for k in ("autoConnect", "autoPair", "useOutput", "useMic"):
+            for k in ("autoConnect", "useOutput", "useMic"):
                 if isinstance(cmd.get(k), bool):
                     self.settings[k] = cmd[k]
             for k in ("order", "manualOnly"):

@@ -645,12 +645,12 @@ Panel {
             text: {
               if (!root.svc) return ""
               var s = root.svc
-              if (s.pairable.length) return s.autoPair ? "Pairing automatically…" : "Click Pair to use them here"
+              if (s.pairable.length) return "Click Pair to use them here"
               if (s.inPairingMode.length) return "Pairing mode seen · finding " + s.inPairingMode[0].model + " over Bluetooth…"
               var kind = s.newNearby.length ? s.newNearby[0].kind : ""
               var hint = s.pairHint(kind)
               if (s.lookingForPair) return hint + " · " + Math.max(0, Math.round(s.pairUntil - s.now)) + " s"
-              return hint + (s.autoPair ? ". Podbay pairs them automatically." : ".")
+              return hint + ". Then click Pair for the device you recognize."
             }
             color: Qt.darker(root.fg, 1.4)
             font.family: root.fontFamily
@@ -679,7 +679,7 @@ Panel {
 
           Repeater {
             model: [
-              { h: "PAIR", t: "AirPods Pro: open the case and hold the button on the back until the light flashes white. AirPods Max: hold the noise control button until the light flashes white. Podbay finds them and pairs them by itself (Settings → Pair automatically)." },
+              { h: "PAIR", t: "AirPods Pro: open the case and hold the button on the back until the light flashes white. AirPods Max: hold the noise control button until the light flashes white. Podbay finds them. Click Pair beside the device you recognize." },
               { h: "CONNECT", t: "Open the case or take the Max out of its case: paired AirPods connect here. Disconnect by hand and Podbay leaves them alone until you put them away and take them out again." },
               { h: "SOUND & MIC", t: "When AirPods connect, sound and microphone move to them; when they disconnect, back to what you had. While the AirPods mic is in use, Bluetooth drops to call quality." },
               { h: "SEVERAL PAIRS", t: "Devices: the higher pair in the list wins when both show up, and takes over from a lower one. Manual pairs only connect when you click Connect." },
@@ -725,15 +725,6 @@ Panel {
             foreground: root.fg
             fontFamily: root.fontFamily
             onClicked: root.svc.setPref("autoConnect", !root.svc.autoConnect)
-          }
-          Toggle {
-            width: parent.width
-            label: "Pair automatically"
-            description: "AirPods put in pairing mode near this PC are paired without asking"
-            checked: root.svc ? root.svc.autoPair : true
-            foreground: root.fg
-            fontFamily: root.fontFamily
-            onClicked: root.svc.setPref("autoPair", !root.svc.autoPair)
           }
           Toggle {
             width: parent.width
