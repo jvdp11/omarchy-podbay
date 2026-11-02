@@ -99,7 +99,7 @@ In the panel's Settings tab, saved in `~/.config/omarchy/omarchy-podbay.json`:
 | `autoPair` | `false` | Legacy setting; automatic pairing is disabled even if an old file says true |
 | `useOutput` / `useMic` | `true` | Move sound / microphone to the AirPods |
 | `soundReactive` | `true` | Pixels dance to the music (panel open only) |
-| `notify` | `true` | Notifications on connect, pair, nearby |
+| `notify` | `true` | Notifications on connect, pairing mode and pair. Unpaired AirPods merely nearby (often a colleague's) stay silent |
 | `order`, `manualOnly` | | Order of preference, hand-only pairs (Devices tab) |
 
 While the AirPods microphone is in use, Bluetooth drops to call quality. That

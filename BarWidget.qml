@@ -24,7 +24,7 @@ Panel {
   readonly property var primary: svc ? svc.primary : null
   readonly property bool barConnected: !!(primary && primary.connected)
   readonly property bool barQuiet: barConnected && (primary.mode === "anc" || primary.mode === "adaptive")
-  readonly property bool barCalling: !!svc && (svc.pairable.length > 0 || svc.newNearby.length > 0 || svc.pairing)
+  readonly property bool barCalling: !!svc && (svc.pairable.length > 0 || svc.pairing)
   readonly property int barBattery: barConnected && svc ? svc.batteryLevel(primary) : -1
   readonly property string barKind: primary ? primary.kind
     : (svc && svc.newNearby.length ? svc.newNearby[0].kind : "max")
