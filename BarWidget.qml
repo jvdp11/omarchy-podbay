@@ -529,15 +529,15 @@ Panel {
                   }
                   Button {
                     width: rowActions.cellWidth
-                    text: row.modelData.autoConnect ? "Auto" : "Manual"
+                    text: row.modelData.autoConnect ? "Ask" : "Manual"
                     active: row.modelData.autoConnect
                     fontSize: Style.font.caption
                     foreground: root.fg
                     fontFamily: root.fontFamily
                     bordered: true
                     tooltipText: row.modelData.autoConnect
-                      ? "Connects when you " + root.svc.wakeHint(row.modelData.kind) + ". Click: only connect by hand"
-                      : "Only connects by hand. Click: connect when you " + root.svc.wakeHint(row.modelData.kind)
+                      ? "Asks to connect when you " + root.svc.wakeHint(row.modelData.kind) + ". Click: never ask, only connect by hand"
+                      : "Only connects by hand. Click: ask to connect when you " + root.svc.wakeHint(row.modelData.kind)
                     onClicked: root.svc.setDeviceAuto(row.modelData.address, !row.modelData.autoConnect)
                   }
                   Button {
@@ -719,8 +719,8 @@ Panel {
 
           Toggle {
             width: parent.width
-            label: "Connect when they appear"
-            description: root.svc ? "When you " + root.svc.wakeHint(root.svc.commonKind) + ", they connect here" : ""
+            label: "Ask to connect when they appear"
+            description: root.svc ? "When you " + root.svc.wakeHint(root.svc.commonKind) + ", a notification asks: Connect or Ignore. No answer is a no" : ""
             checked: root.svc ? root.svc.autoConnect : true
             foreground: root.fg
             fontFamily: root.fontFamily

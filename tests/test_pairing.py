@@ -46,3 +46,45 @@ class PairingTests(unittest.TestCase):
         method("Daemon", "connect")(fake, "user-chosen")
         fake._dev.assert_called_once_with("user-chosen")
         fake._dev.return_value.Connect.assert_called_once()
+
+    def _appearing(self, **over):
+        devices = {"max": {"Paired": True, "Trusted": True, "Address": "70:F9:4A:00:00:01",
+                           "Modalias": "bluetooth:v004Cp202Dd0A01"}}
+        fake = types.SimpleNamespace(
+            devices=devices, settings={"autoConnect": True, "manualOnly": [], "order": []},
+            manual_off=set(), offered=set(), event=Mock(), connect=Mock(), _title=lambda path: "AirPods Max 2")
+        for name in ("_paired_of_model", "_rank", "_connected_airpods"):
+            setattr(fake, name, types.MethodType(method("Daemon", name), fake))
+        for k, v in over.items():
+            setattr(fake, k, v)
+        return fake
+
+    def test_appearing_pair_is_offered_once_and_never_connected(self):
+        fake = self._appearing()
+        offer = method("Daemon", "_auto_connect")
+        offer(fake, 0x202D)
+        offer(fake, 0x202D)  # still around, or back before it counted as gone
+        fake.connect.assert_not_called()
+        fake.event.assert_called_once_with("offer", address="70:F9:4A:00:00:01", title="AirPods Max 2")
+
+    def test_no_offer_when_off_manual_or_disconnected_by_hand(self):
+        offer = method("Daemon", "_auto_connect")
+        for fake in (self._appearing(settings={"autoConnect": False, "manualOnly": [], "order": []}),
+                     self._appearing(settings={"autoConnect": True, "manualOnly": ["70:f9:4a:00:00:01"], "order": []}),
+                     self._appearing(manual_off={"max"})):
+            offer(fake, 0x202D)
+            fake.event.assert_not_called()
+            fake.connect.assert_not_called()
+
+    def test_accept_connects_only_what_was_offered(self):
+        accept = method("Daemon", "accept")
+        fake = self._appearing()
+        accept(fake, "max")
+        fake.connect.assert_not_called()
+        fake.offered.add("max")
+        accept(fake, "max")
+        fake.connect.assert_called_once_with("max", replace=[])
+
+
+if __name__ == "__main__":
+    unittest.main()

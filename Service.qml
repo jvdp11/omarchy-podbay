@@ -7,6 +7,10 @@ import Quickshell.Io
 //
 //   prefs  ~/.config/omarchy/omarchy-podbay.json
 //          {autoConnect, autoPair, notify, useOutput, useMic, order, manualOnly, lastSeen}
+//
+// A pair that appears is never connected by itself: the daemon sends an
+// "offer" and offerConnect() asks with a notification (Connect / Ignore). No
+// answer is a no; the panel still connects it by hand.
 Item {
   id: root
 
@@ -33,7 +37,7 @@ Item {
   property real now: Date.now() / 1000
 
   // ---- Preferences ------------------------------------------------------------
-  property bool autoConnect: true
+  property bool autoConnect: true   // ask to connect when a pair appears
   property bool autoPair: false
   property bool notify: true
   property bool useOutput: true   // sound to the AirPods when they connect
@@ -42,7 +46,7 @@ Item {
   property bool panelOpen: false
   property var levels: []         // 8 bands 0..1 from bin/podbay-levels
   property var order: []          // addresses, most preferred first
-  property var manualOnly: []     // addresses that never auto-connect
+  property var manualOnly: []     // addresses we never ask about
   property var lastSeen: ({})     // address -> epoch of last connection
 
   // ---- Theme palette (colors.toml), for the pixel art -------------------------
@@ -69,6 +73,23 @@ Item {
 
   function setMode(address, mode) { send({ cmd: "mode", address: address, mode: mode }) }
   function connectDevice(address) { send({ cmd: "connect", address: address }) }
+  // Yes to the "detected, connect?" notification. Only a pair the daemon
+  // offered is connected, so a stray IPC call can't connect anything else.
+  function acceptOffer(address) { send({ cmd: "accept", address: String(address).slice(0, 17) }) }
+
+  readonly property int offerSeconds: 15
+
+  // "AirPods Max 2 detected · Connect?" with Connect and Ignore. It goes away
+  // by itself after offerSeconds, which counts as Ignore. Shown also with
+  // notifications off: it replaces connecting by itself.
+  function offerConnect(address, title) {
+    if (!/^[0-9A-Fa-f:]{17}$/.test(String(address))) return
+    Quickshell.execDetached(["omarchy-notification-send", "-g", "󰋋", "-t", String(offerSeconds * 1000), "--transient",
+      String(title || "AirPods").slice(0, 60) + " detected", "Connect?",
+      "--action", "Connect", "omarchy-shell", "jvdp.podbay", "accept",
+      "--action", "Ignore", "true",
+      "--with", String(address)])
+  }
   function disconnectDevice(address) { send({ cmd: "disconnect", address: address }) }
   function pairDevice(address) { send({ cmd: "pair", address: address }) }
   function forgetDevice(address) { send({ cmd: "forget", address: address }) }
@@ -262,7 +283,8 @@ Item {
   }
 
   function onEvent(e) {
-    if (e.event === "paired") notifyUser(String(e.title || "AirPods"), "Paired")
+    if (e.event === "offer") offerConnect(e.address, e.title)
+    else if (e.event === "paired") notifyUser(String(e.title || "AirPods"), "Paired")
     else if (e.event === "pairingmode")
       notifyUser(String(e.title || "AirPods") + " in pairing mode",
                  autoPair ? "Pairing them here…" : "Open Podbay to pair them")
@@ -362,6 +384,7 @@ Item {
     function mode(m: string): void { if (root.primary) root.setMode(root.primary.address, m) }
     function cycle(): void { root.cycleMode() }
     function toggle(): void { root.toggleConnection() }
+    function accept(address: string): void { root.acceptOffer(address) }
     function pair(): void { root.lookForPair(90) }
   }
 }

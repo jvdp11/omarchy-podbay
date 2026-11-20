@@ -9,7 +9,10 @@ What it does:
   * Listens for Apple "proximity pairing" BLE adverts, which AirPods send
     when the case opens or the Max leaves its case: model, rough battery
     (10 % steps), lid state. That is how we know they are "here".
-  * Auto-connects approved pairs; new pairs require a device-specific Pair click.
+  * When an approved pair appears, offers to connect it (the shell asks:
+    Connect / Ignore) and connects only on "accept". One offer per appearance:
+    unanswered or ignored, it stays quiet until the pair has gone away and come
+    back. New pairs require a device-specific Pair click.
   * Speaks AAP (Apple Accessory Protocol, L2CAP PSM 0x1001) to a connected
     pair: noise-control mode (read + set, also when changed on the device),
     exact battery per bud/case, ear detection.
@@ -17,11 +20,16 @@ What it does:
 Commands (stdin, one JSON object per line):
   {"cmd": "mode", "address": "AA:..", "mode": "anc|transparency|adaptive|off"}
   {"cmd": "connect"|"disconnect"|"pair"|"forget", "address": "AA:.."}
+  {"cmd": "accept", "address": "AA:.."}  yes to an offer: connect, taking over
+                                         from a pair you prefer less
   {"cmd": "watch", "on": true}          panel open: scan continuously
   {"cmd": "pairwindow", "seconds": 60}  look for a pair in pairing mode
   {"cmd": "settings", "autoConnect": true, "autoPair": true,
    "order": ["AA:..", ...],              preference, first = most wanted
-   "manualOnly": ["AA:..", ...]}         pairs that never auto-connect
+   "manualOnly": ["AA:..", ...]}         pairs that are never offered
+
+Events (stdout): {"type": "event", "event": "offer", "address": "AA:..", "title": "…"}
+asks the shell to offer connecting that pair; also nearby, pairingmode, pairing, paired.
 """
 import json
 import os
@@ -81,7 +89,6 @@ AAP_HEADER = bytes.fromhex("04000400")
 NEARBY_TTL = 45          # s without an advert before a pair counts as gone (> PERIODIC_EVERY)
 PERIODIC_EVERY = 30      # s between background LE scans
 PERIODIC_LEN = 6         # s per background scan
-AUTOCONNECT_GAP = 45     # s between auto-connect attempts per device
 PAIR_WINDOW_GAP = 600    # s before an unknown pair nearby opens another pairing window
 
 
@@ -386,8 +393,8 @@ class Daemon:
         self.aap = {}           # path -> AAP
         self.live = {}          # path -> AAP-derived state
         self.pairing = set()    # paths we are pairing
-        self.manual_off = set() # paths the user disconnected; no auto-connect until they leave
-        self.last_auto = {}     # path -> time of last auto-connect attempt
+        self.manual_off = set() # paths the user disconnected; no offer until they leave
+        self.offered = set()    # paths offered since they appeared; no second offer until they leave
         self.pair_window_at = {}  # model -> when its last pairing window opened
         self.bredr_until = 0      # classic-only scan: a pair just entered pairing mode
         self.pairing_mode = {}    # classic address -> (model, seen) from pairing-mode adverts
@@ -533,28 +540,34 @@ class Daemon:
         addr = str(self.devices.get(path, {}).get("Address", "")).upper()
         return order.index(addr) if addr in order else len(order)
 
+    def _connected_airpods(self):
+        return [q for q, d in self.devices.items() if d.get("Connected") and is_airpods(d)]
+
     def _auto_connect(self, model):
-        """A paired pair appeared. Connect it unless a pair you prefer is
-        already connected; if it beats the connected one, it takes over."""
+        """A paired pair appeared. Offer to connect it (never connect by
+        itself), unless a pair you prefer is already connected. Once per
+        appearance: no answer counts as no."""
         if not self.settings["autoConnect"]:
             return
-        now = time.time()
         manual = {a.upper() for a in self.settings.get("manualOnly", [])}
-        connected = [q for q, d in self.devices.items() if d.get("Connected") and is_airpods(d)]
+        connected = self._connected_airpods()
         for path in sorted(self._paired_of_model(model), key=self._rank):
             p = self.devices[path]
-            if p.get("Connected") or path in self.manual_off:
+            if p.get("Connected") or path in self.manual_off or path in self.offered:
                 continue
             if str(p.get("Address", "")).upper() in manual:
                 continue
             if any(self._rank(q) <= self._rank(path) for q in connected):
                 continue  # you prefer the pair you're using
-            if now - self.last_auto.get(path, 0) < AUTOCONNECT_GAP:
-                continue
-            self.last_auto[path] = now
-            self.event("autoconnect", title=self._title(path))
-            self.connect(path, replace=connected)
+            self.offered.add(path)
+            self.event("offer", address=str(p.get("Address", "")), title=self._title(path))
             return
+
+    def accept(self, path):
+        """Yes to an offer: connect, and take over from a pair you prefer less."""
+        if path not in self.offered or self.devices.get(path, {}).get("Connected"):
+            return
+        self.connect(path, replace=[q for q in self._connected_airpods() if self._rank(q) > self._rank(path)])
 
     def _maybe_autopair(self, path):
         # Discovery/name/advertisement data are unauthenticated. In particular,
@@ -729,6 +742,7 @@ class Daemon:
             del self.nearby[m]
             for path in self._paired_of_model(m):
                 self.manual_off.discard(path)
+                self.offered.discard(path)
         # Background look-around (a short LE scan) only while no AirPods are
         # connected: scanning next to an A2DP stream can make audio stutter.
         busy = any(p.get("Connected") and is_airpods(p) for p in self.devices.values())
@@ -877,6 +891,8 @@ class Daemon:
                 ADAPTER, "Powered", dbus.Boolean(bool(cmd.get("on"))))
         elif path and c == "connect":
             self.connect(path)
+        elif path and c == "accept":
+            self.accept(path)
         elif path and c == "disconnect":
             self.disconnect(path)
         elif path and c == "pair":

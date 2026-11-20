@@ -7,7 +7,7 @@
 
 **AirPods for the [Omarchy](https://omarchy.org) bar.**
 Pixel-art AirPods in your theme colours, battery per bud and case, noise
-control, and AirPods that just connect when you open the case.
+control, and AirPods that offer to connect when you open the case.
 
 *Open the pod bay doors.*
 
@@ -29,7 +29,7 @@ control, and AirPods that just connect when you open the case.
 | 🎧 **AirPods Max & AirPods Pro** | Animated pixel art for both, drawn in your Omarchy theme and redrawn when you switch themes. |
 | 🔋 **Battery** | Left, right and case (or the Max's single battery), read straight from the AirPods. |
 | 🔇 **Noise control** | Off, Transparency, Adaptive, ANC. Set it here, or press the button on the AirPods and Podbay follows. |
-| ⚡ **Connects by itself** | Open the case or take the Max out: paired AirPods connect, and sound and mic move to them. Disconnect, and everything goes back. |
+| ⚡ **Asks to connect** | Open the case or take the Max out: a notification says *AirPods Max 2 detected · Connect?* with **Connect** and **Ignore**. Connect, and sound and mic move to them; disconnect, and everything goes back. Ignore it or let it time out (15 s) and nothing connects until you put them away and take them out again; the panel still connects them by hand. |
 | 🤝 **Pair with confirmation** | Put AirPods in pairing mode, then click Pair beside the device you recognize. |
 | 🗂️ **Several pairs** | Put them in order of preference; the higher pair wins and takes over. Or set a pair to connect only by hand. |
 | 🎶 **Dances to the music** | Sound waves off the Max's cups, an equalizer between the Pro buds, while the panel is open. |
@@ -64,7 +64,7 @@ Needs BlueZ, `python-dbus` and `python-gobject`, all on Omarchy by default.
    - **AirPods Max:** hold the noise control button,
 
    until the light flashes white. Click Pair beside the device you recognize; Podbay then pairs and connects it.
-2. **From then on:** open the case or take the Max out, and they connect.
+2. **From then on:** open the case or take the Max out, and press **Connect** in the notification.
    Sound and microphone follow; disconnect and they go back to what you had.
 
 | In the bar | |
@@ -83,6 +83,7 @@ omarchy-shell jvdp.podbay status        # JSON: text, devices, nearby
 omarchy-shell jvdp.podbay mode anc      # anc | transparency | adaptive | off
 omarchy-shell jvdp.podbay cycle         # next listening mode
 omarchy-shell jvdp.podbay toggle        # connect / disconnect
+omarchy-shell jvdp.podbay accept <address>   # yes to a connect offer (what the Connect button runs)
 omarchy-shell jvdp.podbay pair          # look for AirPods in pairing mode (90 s)
 ```
 
@@ -95,7 +96,7 @@ In the panel's Settings tab, saved in `~/.config/omarchy/omarchy-podbay.json`:
 
 | Key | Default | |
 |---|---|---|
-| `autoConnect` | `true` | Connect when they appear (case open, Max out) |
+| `autoConnect` | `true` | Ask to connect when they appear (case open, Max out): a notification with **Connect** and **Ignore**. No answer is a no |
 | `autoPair` | `false` | Legacy setting; automatic pairing is disabled even if an old file says true |
 | `useOutput` / `useMic` | `true` | Move sound / microphone to the AirPods |
 | `soundReactive` | `true` | Pixels dance to the music (panel open only) |
