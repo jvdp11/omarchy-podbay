@@ -16,7 +16,9 @@ Panel {
   ipcTarget: "jvdp.podbay.panel"
 
   readonly property var svc: bar && bar.shell && bar.shell.serviceFor ? bar.shell.serviceFor("jvdp.podbay") : null
-  readonly property color fg: bar ? bar.barForeground : Color.foreground
+  // Panel content takes the theme's text colour; barForeground (dark over a
+  // light wallpaper on a transparent bar) is only for the pill in the bar.
+  readonly property color fg: bar ? bar.foreground : Color.foreground
   readonly property color accentColor: Color.accent
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
@@ -98,7 +100,7 @@ Panel {
         anchors.verticalCenter: parent.verticalCenter
         rows: root.barKind === "max" ? Sprites.iconMax : Sprites.iconPro
         size: Style.font.icon
-        color: root.barCalling || root.barQuiet ? root.accentColor : root.fg
+        color: root.barCalling || root.barQuiet ? root.accentColor : root.barForeground
         alpha: root.barConnected || root.barCalling ? 1 : 0.55
 
         SequentialAnimation on opacity {
@@ -115,7 +117,7 @@ Panel {
         anchors.verticalCenter: parent.verticalCenter
         textFormat: Text.PlainText
         text: root.barBattery + "%"
-        color: root.barBattery <= 20 ? Color.urgent : root.fg
+        color: root.barBattery <= 20 ? Color.urgent : root.barForeground
         font.family: button.fontFamily
         font.pixelSize: button.fontSize
       }
