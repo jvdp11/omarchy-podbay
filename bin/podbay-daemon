@@ -89,6 +89,7 @@ AAP_HEADER = bytes.fromhex("04000400")
 NEARBY_TTL = 45          # s without an advert before a pair counts as gone (> PERIODIC_EVERY)
 PERIODIC_EVERY = 30      # s between background LE scans
 PERIODIC_LEN = 6         # s per background scan
+STOP_CHECK_EVERY = 10    # s between stray-scan checks while we want no scan
 PAIR_WINDOW_GAP = 600    # s before an unknown pair nearby opens another pairing window
 
 
@@ -401,6 +402,7 @@ class Daemon:
         self.watch = False
         self.pair_until = 0
         self.discovering_by_us = False
+        self.next_stop_check = 0
         self.periodic_until = 0
         self.next_periodic = time.time() + 3
         self.settings = {"autoConnect": True, "autoPair": False, "useOutput": True, "useMic": True,
@@ -463,7 +465,9 @@ class Daemon:
         path = str(path)
         if iface == ADAPTER and path == self.adapter_path:
             self.adapter.update(changed)
-            if "Discovering" in changed and not changed["Discovering"]:
+            # Not "Discovering" going False: that signal is shared and late
+            # (see _sync_discovery). Powering off does end every session.
+            if "Powered" in changed and not changed["Powered"]:
                 self.discovering_by_us = False
             self.emit()
             return
@@ -750,28 +754,60 @@ class Daemon:
             self.next_periodic = now + PERIODIC_EVERY
             if (self.settings["autoConnect"] or self.settings["autoPair"]) and not busy:
                 self.periodic_until = now + PERIODIC_LEN
-        want = self._want_scan(now)
-        try:
-            if want and not self.discovering_by_us:
-                ad = self._adapter()
-                ad.SetDiscoveryFilter({"Transport": want, "DuplicateData": True})
-                ad.StartDiscovery()
-                self.discovering_by_us = want
-            elif want and self.discovering_by_us != want:
-                ad = self._adapter()
-                ad.StopDiscovery()
-                ad.SetDiscoveryFilter({"Transport": want, "DuplicateData": True})
-                ad.StartDiscovery()
-                self.discovering_by_us = want
-            elif not want and self.discovering_by_us:
-                self._adapter().StopDiscovery()
-                self.discovering_by_us = False
-        except dbus.DBusException as e:
-            if "InProgress" not in str(e):
-                log("discovery", e)
+        self._sync_discovery(self._want_scan(now), now)
         if gone:
             self.emit()
         return True
+
+    def _sync_discovery(self, want, now):
+        """Bring our BlueZ discovery session in line with `want`.
+
+        Whether our session runs is known from our own calls only. The
+        adapter's Discovering property is shared by every client and its
+        signals arrive late: the False from a Stop lands after the Start that
+        followed it. Reading it as "our scan ended" once left a scan running
+        for hours, which on this Broadcom chip blocks LE devices (mice,
+        keyboards) from reconnecting.
+        """
+        if not self.adapter_path:
+            self.discovering_by_us = False  # adapter gone: so are its sessions
+            return
+        ad = self._adapter()
+        try:
+            if want:
+                if self.discovering_by_us == want:
+                    return
+                if self.discovering_by_us:
+                    self._stop_discovery(ad)
+                ad.SetDiscoveryFilter({"Transport": want, "DuplicateData": True})
+                try:
+                    ad.StartDiscovery()
+                except dbus.DBusException as e:
+                    # BlueZ says InProgress when this client already has a
+                    # session: it is ours, now running with the new filter.
+                    if "InProgress" not in str(e):
+                        raise
+                self.discovering_by_us = want
+            elif self.discovering_by_us:
+                self._stop_discovery(ad)
+            elif self.adapter.get("Discovering") and now >= self.next_stop_check:
+                # Safety net: the adapter scans and we think it isn't ours.
+                # StopDiscovery only ends this client's own session, so it is
+                # harmless when another app scans; if we had lost track of
+                # ours, this ends it.
+                self.next_stop_check = now + STOP_CHECK_EVERY
+                self._stop_discovery(ad)
+        except dbus.DBusException as e:
+            log("discovery", e)
+
+    def _stop_discovery(self, ad):
+        self.discovering_by_us = False
+        try:
+            ad.StopDiscovery()
+        except dbus.DBusException as e:
+            # Failed / NotAuthorized: this client had no session. Fine.
+            if not any(k in str(e) for k in ("Failed", "NotAuthorized", "NotReady")):
+                log("stop discovery", e)
 
     # ---- Output ------------------------------------------------------------------
 
