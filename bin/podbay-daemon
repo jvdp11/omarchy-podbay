@@ -91,6 +91,11 @@ PERIODIC_EVERY = 30      # s between background LE scans
 PERIODIC_LEN = 6         # s per background scan
 STOP_CHECK_EVERY = 10    # s between stray-scan checks while we want no scan
 PAIR_WINDOW_GAP = 600    # s before an unknown pair nearby opens another pairing window
+PAIRING_MODE_TTL = 30    # s a pairing-mode advert counts
+PAIRING_MODE_MAX = 32    # addresses remembered (adverts are unauthenticated), oldest dropped
+PAIRING_EVENT_GAP = 60   # s between "pairingmode" events for one address
+AAP_RETRIES = 5          # reconnects of the AAP channel while the device stays connected
+STDIN_MAX = 1 << 20      # bytes of one unfinished command line
 
 
 class Audio:
@@ -190,6 +195,12 @@ class Audio:
 
 def log(*a):
     print("podbay:", *a, file=sys.stderr, flush=True)
+
+
+def split_lines(buf, data):
+    """Complete lines in buf + data, and the unfinished rest to keep for the next read."""
+    *lines, rest = (buf + data).split(b"\n")
+    return lines, rest if len(rest) <= STDIN_MAX else b""
 
 
 def pid_from_modalias(modalias):
@@ -347,13 +358,13 @@ class AAP:
                 log("aap connect", self.address, e)
                 time.sleep(2 + attempt * 2)
         if not self.sock:
-            GLib.idle_add(self.d.on_aap_state, self.path, False)
+            GLib.idle_add(self.d.on_aap_state, self.path, False, self)
             return
         try:
             for pkt in (AAP_HANDSHAKE, AAP_FEATURES, AAP_NOTIFY):
                 self.sock.send(pkt)
                 time.sleep(0.15)
-            GLib.idle_add(self.d.on_aap_state, self.path, True)
+            GLib.idle_add(self.d.on_aap_state, self.path, True, self)
             while not self.closed:
                 data = self.sock.recv(1024)
                 if not data:
@@ -362,7 +373,7 @@ class AAP:
         except OSError as e:
             if not self.closed:
                 log("aap read", self.address, e)
-        GLib.idle_add(self.d.on_aap_state, self.path, False)
+        GLib.idle_add(self.d.on_aap_state, self.path, False, self)
 
     def send(self, data):
         try:
@@ -392,13 +403,16 @@ class Daemon:
         self.adapter = {}
         self.nearby = {}        # model id -> advert dict + "seen"
         self.aap = {}           # path -> AAP
+        self.aap_retries = {}   # path -> reconnects tried since the channel last came up
+        self.stdin_buf = b""
         self.live = {}          # path -> AAP-derived state
         self.pairing = set()    # paths we are pairing
         self.manual_off = set() # paths the user disconnected; no offer until they leave
         self.offered = set()    # paths offered since they appeared; no second offer until they leave
         self.pair_window_at = {}  # model -> when its last pairing window opened
         self.bredr_until = 0      # classic-only scan: a pair just entered pairing mode
-        self.pairing_mode = {}    # classic address -> (model, seen) from pairing-mode adverts
+        self.pairing_mode = {}    # classic address -> (model, seen) from pairing-mode adverts, oldest first
+        self.pairing_event_at = {}  # classic address -> when its "pairingmode" event last went out
         self.watch = False
         self.pair_until = 0
         self.discovering_by_us = False
@@ -419,6 +433,7 @@ class Daemon:
         self.bus.add_signal_receiver(self._ifaces_removed, "InterfacesRemoved", OBJMGR)
         self.bus.add_signal_receiver(self._props_changed, "PropertiesChanged", PROPS,
                                      bus_name=BLUEZ, path_keyword="path")
+        self.bus.add_signal_receiver(self._name_owner, "NameOwnerChanged", "org.freedesktop.DBus", arg0=BLUEZ)
 
         self.agent = Agent(self.bus, self)
         try:
@@ -436,6 +451,11 @@ class Daemon:
         self.emit()
 
     # ---- BlueZ objects ---------------------------------------------------
+
+    def _name_owner(self, name, old, new):
+        if old:   # bluetoothd went away or was replaced: our objects and agent are stale, the shell respawns us
+            log("bluetoothd restarted, exiting")
+            loop.quit()
 
     def _ifaces_added(self, path, ifaces):
         path = str(path)
@@ -513,8 +533,7 @@ class Daemon:
             # Held the button: find it over classic Bluetooth (only that bearer
             # pairs headphones), scanning classic-only for a moment.
             now = time.time()
-            fresh = info["address"] not in self.pairing_mode
-            self.pairing_mode[info["address"]] = (model, now)
+            fresh = self._note_pairing_mode(info["address"], model, now)
             self.pair_until = max(self.pair_until, now + 60)
             if fresh:
                 self.bredr_until = now + 20
@@ -533,6 +552,22 @@ class Daemon:
                 self.pair_window_at[model] = now
                 self.pair_until = max(self.pair_until, now + 60)
         self.emit()
+
+    def _note_pairing_mode(self, address, model, now):
+        """Remember a pairing-mode advert; True when it is worth an event. The address comes
+        from an unauthenticated advert, so entries expire, are capped and are rate-limited."""
+        self.pairing_mode = {a: v for a, v in self.pairing_mode.items() if now - v[1] < PAIRING_MODE_TTL}
+        self.pairing_event_at = {a: t for a, t in self.pairing_event_at.items() if now - t < PAIRING_EVENT_GAP}
+        fresh = address not in self.pairing_mode and address not in self.pairing_event_at
+        self.pairing_mode.pop(address, None)
+        self.pairing_mode[address] = (model, now)
+        while len(self.pairing_mode) > PAIRING_MODE_MAX:
+            del self.pairing_mode[next(iter(self.pairing_mode))]
+        if fresh:
+            self.pairing_event_at[address] = now
+            while len(self.pairing_event_at) > PAIRING_MODE_MAX:
+                del self.pairing_event_at[next(iter(self.pairing_event_at))]
+        return fresh
 
     def _paired_of_model(self, model):
         return [path for path, p in self.devices.items()
@@ -680,13 +715,22 @@ class Daemon:
         conn = self.aap.pop(path, None)
         if conn:
             conn.close()
+        self.aap_retries.pop(path, None)
         self.live.pop(path, None)
 
-    def on_aap_state(self, path, up):
+    def on_aap_state(self, path, up, conn=None):
+        if conn is not None and self.aap.get(path) is not conn:
+            return False   # a late callback from a connection that has been replaced or stopped
         st = self.live.setdefault(path, {})
         st["aap"] = bool(up)
-        if not up and path in self.aap and self.aap[path].closed is False:
+        if up:
+            self.aap_retries.pop(path, None)
+        elif path in self.aap and self.aap[path].closed is False:
             self.aap.pop(path, None)
+            n = self.aap_retries.get(path, 0)
+            if n < AAP_RETRIES:   # still connected: try the channel again, a bit later each time
+                self.aap_retries[path] = n + 1
+                GLib.timeout_add_seconds(min(60, 5 << n), lambda: self._start_aap(path) and False)
         self.emit()
         return False
 
@@ -893,19 +937,28 @@ class Daemon:
         return None
 
     def _stdin(self, fd, cond):
-        line = sys.stdin.readline()
-        if not line:
+        try:
+            data = os.read(fd, 65536)
+        except BlockingIOError:
+            return True
+        except OSError:
+            data = b""
+        if not data:
             loop.quit()  # the shell went away
             return False
-        try:
-            cmd = json.loads(line)
-        except ValueError:
-            return True
-        try:
-            self.handle(cmd)
-        except dbus.DBusException as e:
-            self.error = str(e.get_dbus_message() or e)
-            self.emit()
+        lines, self.stdin_buf = split_lines(self.stdin_buf, data)
+        for line in lines:
+            try:
+                cmd = json.loads(line)
+            except ValueError:
+                continue
+            try:
+                self.handle(cmd)
+            except dbus.DBusException as e:
+                self.error = str(e.get_dbus_message() or e)
+                self.emit()
+            except Exception as e:  # noqa: BLE001 - one bad command must not end the stdin watch
+                log("command", e)
         return True
 
     def handle(self, cmd):

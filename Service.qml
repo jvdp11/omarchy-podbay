@@ -33,6 +33,8 @@ Item {
   property var inPairingMode: []  // pairs that broadcast "pairing mode" right now
   property string error: ""
   property bool daemonUp: false
+  property real daemonStartedAt: 0
+  property int restartDelay: 5000      // ms before the next daemon respawn
   property string daemonError: ""
   property real now: Date.now() / 1000
 
@@ -313,14 +315,19 @@ Item {
       root.daemonUp = running
       if (running) {
         root.daemonError = ""
+        root.daemonStartedAt = Date.now()
         Qt.callLater(root.sendSettings)
       } else {
+        if (Date.now() - root.daemonStartedAt > 30000) root.restartDelay = 5000   // it stayed up: start over
+        restartTimer.interval = root.restartDelay
+        root.restartDelay = Math.min(60000, root.restartDelay * 2)
         restartTimer.start()
       }
     }
   }
 
-  // The daemon exits when BlueZ restarts or the adapter vanishes: retry.
+  // The daemon exits when BlueZ restarts or the adapter vanishes: retry, waiting
+  // longer each time (5 s up to 60 s) while it keeps failing, e.g. Bluetooth off.
   Timer {
     id: restartTimer
     interval: 5000
